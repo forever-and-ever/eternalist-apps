@@ -92,8 +92,12 @@ leases. Do not poll platform state to synthesize a visibility oracle.
 Same-window concealment is likewise a capability, not an OS-name guess.
 `CloseDisposition::HideOrExit` keeps the process resident only where the host
 can both hide and later reveal its native window; an incapable backend follows
-ordinary close semantics. A visible but logically concealed frozen window is
-never an admissible fallback.
+ordinary close semantics. `WindowSpec::concealed` starts the same concealment
+before the first frame and primes the window with one unpresented pass, so the
+first reveal finds fonts, texture atlas and layout standing;
+`NativeApp::reveal_placement` chooses where and at what size each reveal maps
+the window. A visible but logically concealed frozen window is never an
+admissible fallback.
 
 Every animation and physical response owns a finite wake lease. Stable hover,
 focus, loading state, or unchanged geometry may not renew that lease merely

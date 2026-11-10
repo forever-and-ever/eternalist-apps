@@ -75,7 +75,8 @@ pub use crash_reports::CrashReportSpec;
 pub use crash_reports::{ACCEPTANCE, native_crash_acceptance};
 #[cfg(not(target_family = "wasm"))]
 pub use native::{
-    CloseDisposition, NativeApp, NativeWake, ResponsivenessSpec, WindowSpec, run, run_with,
+    CloseDisposition, NativeApp, NativeWake, ResponsivenessSpec, WindowPlacement, WindowSpec, run,
+    run_with,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use paths::ApplicationPaths;

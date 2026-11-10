@@ -36,7 +36,7 @@ use std::{
 use winit::platform::x11::{ActiveEventLoopExtX11 as _, WindowAttributesExtX11 as _, WindowType};
 use winit::{
     application::ApplicationHandler,
-    dpi::{LogicalSize, PhysicalSize},
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event::{StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy},
     window::{Window, WindowAttributes},
@@ -61,6 +61,25 @@ pub struct WindowSpec {
     /// Whether X11 window managers should treat the window as a floating utility.
     #[cfg(target_os = "linux")]
     pub floating: bool,
+    /// Whether the window starts concealed, awaiting the application's first
+    /// reveal request.
+    ///
+    /// The host runs the application's first pass unpresented as soon as the
+    /// window exists, so the first reveal finds fonts and layout standing.
+    /// Every reveal applies [`NativeApp::reveal_placement`] while the window is
+    /// still unmapped, so a window manager that adopts a mapped window's own
+    /// geometry, as i3 does, shows it exactly there. Where
+    /// [`Capabilities::retirement`] holds, the window cannot be hidden and
+    /// starts revealed.
+    pub concealed: bool,
+}
+
+/// Where a concealed window reappears: its physical outer position and inner
+/// size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowPlacement {
+    pub position: [i32; 2],
+    pub inner_size: [u32; 2],
 }
 
 /// Main-thread wall-time obligations owned by the native product.
@@ -103,6 +122,7 @@ impl WindowSpec {
             initial_size,
             #[cfg(target_os = "linux")]
             floating: false,
+            concealed: false,
         }
     }
 
@@ -112,6 +132,19 @@ impl WindowSpec {
     pub const fn floating(mut self) -> Self {
         self.floating = true;
         self
+    }
+
+    /// Start concealed and reveal where [`NativeApp::reveal_placement`] puts
+    /// the window.
+    #[must_use]
+    pub const fn concealed(mut self) -> Self {
+        self.concealed = true;
+        self
+    }
+
+    /// Whether this run launches concealed: only a window that can be hidden does.
+    fn conceals_launch(&self, capabilities: Capabilities) -> bool {
+        self.concealed && !capabilities.retirement
     }
 }
 
@@ -162,13 +195,23 @@ pub trait NativeApp {
         CloseDisposition::Exit
     }
 
-    /// Consume an application-owned request to reveal a window previously hidden by
+    /// Consume an application-owned request to reveal a window concealed at
+    /// launch by [`WindowSpec::concealed`] or later by
     /// [`CloseDisposition::HideOrExit`].
     ///
     /// External controllers must call [`NativeWake::wake`] after raising this signal
     /// so the sleeping native event loop observes it.
     fn take_reveal_request(&mut self) -> bool {
         false
+    }
+
+    /// Choose where and at what size a concealed window reappears.
+    ///
+    /// The host asks just before it maps the window, always after at least one
+    /// pass, so egui's fonts can measure the content; `None` leaves the
+    /// placement to the platform.
+    fn reveal_placement(&mut self) -> Option<WindowPlacement> {
+        None
     }
 
     /// Consume an application-owned request to hide the window after the frame
@@ -587,6 +630,12 @@ fn run_armed<A: NativeApp>(
         #[cfg(feature = "egui-test")]
         witness,
     };
+    if A::WINDOW.conceals_launch(capabilities) {
+        shell
+            .window_standing
+            .concealments
+            .set(Concealment::Hidden, true);
+    }
     let event_result = event_loop.run_app(&mut shell).context("run event loop");
     wake.disarm();
     event_result?;
@@ -700,7 +749,7 @@ impl<A: NativeApp> Shell<A> {
             Presentation::Concealed => return Ok(()),
             Presentation::Background | Presentation::Foreground => {}
         }
-        let (Some(rig), Some(gpu)) = (self.rig.as_mut(), self.gpu.as_mut()) else {
+        let (Some(_), Some(_)) = (&self.rig, &self.gpu) else {
             return Ok(());
         };
         let begun = Instant::now();
@@ -721,53 +770,11 @@ impl<A: NativeApp> Shell<A> {
             .witness
             .as_ref()
             .map(|_| egui_tester_witness::FramePulse::begin());
-        let safe_area = platform::safe_area(&self.ctx, &rig.window, event_loop, &mut self.bars)
-            .context("read platform safe area")?;
-        if safe_area.unsettled {
-            schedule_repaint(
-                &self.governor,
-                &self.alarm,
-                &rig.window,
-                Duration::from_millis(16),
-                RepaintOrigin::External,
-            );
-        }
-        let mut raw_input = main_phase!("frame.input", rig.input.take_egui_input(&rig.window));
-        raw_input.safe_area_insets = safe_area.insets;
-        let mut output = main_phase!(
-            "frame.ui",
-            self.ctx.run_ui(raw_input, |root| {
-                self.crash_reports.quarantine_input(root.ctx());
-                if safe_area.insets.is_some() {
-                    let mut safe = root.new_child(
-                        egui::UiBuilder::new()
-                            .id_salt("eternalist-safe-area")
-                            .max_rect(root.ctx().content_rect()),
-                    );
-                    self.app.draw(&mut safe);
-                } else {
-                    self.app.draw(root);
-                }
-                self.crash_reports.restore_input(root.ctx());
-                self.crash_reports.show(root.ctx());
-            })
-        );
+        let mut output = self.pass(event_loop)?;
         frame_span.record("pixels_per_point", output.pixels_per_point);
-        let title = self.app.window_title();
-        if title != self.window_title {
-            rig.window.set_title(&title);
-            self.window_title = title;
-        }
-        main_phase!(
-            "frame.platform_output",
-            rig.handle_platform_output(event_loop, output.platform_output)?
-        );
-        if let Some(viewport) = output.viewport_output.get(&egui::ViewportId::ROOT) {
-            main_phase!(
-                "frame.viewport_commands",
-                rig.process_viewport_commands(&self.ctx, viewport.commands.iter().cloned())
-            );
-        }
+        let (Some(rig), Some(gpu)) = (self.rig.as_mut(), self.gpu.as_mut()) else {
+            return Ok(());
+        };
         let primitives = main_phase!(
             "frame.tessellate",
             self.ctx.tessellate(output.shapes, output.pixels_per_point)
@@ -894,6 +901,75 @@ impl<A: NativeApp> Shell<A> {
         Ok(())
     }
 
+    /// Run one application pass and apply its window-side output: title,
+    /// platform output and viewport commands.
+    fn pass(&mut self, event_loop: &ActiveEventLoop) -> Result<egui::FullOutput> {
+        let rig = self
+            .rig
+            .as_mut()
+            .context("run an application pass without a native window")?;
+        let safe_area = platform::safe_area(&self.ctx, &rig.window, event_loop, &mut self.bars)
+            .context("read platform safe area")?;
+        if safe_area.unsettled {
+            schedule_repaint(
+                &self.governor,
+                &self.alarm,
+                &rig.window,
+                Duration::from_millis(16),
+                RepaintOrigin::External,
+            );
+        }
+        let mut raw_input = main_phase!("frame.input", rig.input.take_egui_input(&rig.window));
+        raw_input.safe_area_insets = safe_area.insets;
+        let mut output = main_phase!(
+            "frame.ui",
+            self.ctx.run_ui(raw_input, |root| {
+                self.crash_reports.quarantine_input(root.ctx());
+                if safe_area.insets.is_some() {
+                    let mut safe = root.new_child(
+                        egui::UiBuilder::new()
+                            .id_salt("eternalist-safe-area")
+                            .max_rect(root.ctx().content_rect()),
+                    );
+                    self.app.draw(&mut safe);
+                } else {
+                    self.app.draw(root);
+                }
+                self.crash_reports.restore_input(root.ctx());
+                self.crash_reports.show(root.ctx());
+            })
+        );
+        let title = self.app.window_title();
+        if title != self.window_title {
+            rig.window.set_title(&title);
+            self.window_title = title;
+        }
+        main_phase!(
+            "frame.platform_output",
+            rig.handle_platform_output(event_loop, std::mem::take(&mut output.platform_output))?
+        );
+        if let Some(viewport) = output.viewport_output.get(&egui::ViewportId::ROOT) {
+            main_phase!(
+                "frame.viewport_commands",
+                rig.process_viewport_commands(&self.ctx, viewport.commands.iter().cloned())
+            );
+        }
+        Ok(output)
+    }
+
+    /// Run the first pass of a window raised concealed without presenting it,
+    /// so its first reveal finds fonts, the texture atlas and the
+    /// application's layout standing.
+    fn prime(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let _prime = tracing::info_span!(target: "eternalist::main", "prime").entered();
+        let output = self.pass(event_loop)?;
+        if let Some(gpu) = &self.gpu {
+            upload_textures(&gpu.render, &output.textures_delta);
+            free_textures(&gpu.render, &output.textures_delta);
+        }
+        Ok(())
+    }
+
     fn tend_alarm(&self) {
         if self.governor.presentation() == Presentation::Concealed {
             return;
@@ -987,7 +1063,17 @@ impl<A: NativeApp> Shell<A> {
         self.window_standing
             .concealments
             .set(Concealment::Minimized, false);
+        let placement = self.app.reveal_placement();
         if let Some(rig) = &self.rig {
+            if let Some(WindowPlacement {
+                position: [x, y],
+                inner_size: [w, h],
+            }) = placement
+            {
+                rig.window.set_outer_position(PhysicalPosition::new(x, y));
+                // The resize lands with the next surface configuration either way.
+                let _ = rig.window.request_inner_size(PhysicalSize::new(w, h));
+            }
             rig.window.set_visible(true);
             rig.window.set_minimized(false);
             rig.window.focus_window();
@@ -1055,6 +1141,13 @@ impl<A: NativeApp> ApplicationHandler<Spark> for Shell<A> {
                     self.abort(event_loop, error.context("raise native window"));
                     return;
                 }
+            }
+            if A::WINDOW.conceals_launch(self.capabilities)
+                && self.ctx.cumulative_pass_nr() == 0
+                && let Err(error) = self.prime(event_loop)
+            {
+                self.abort(event_loop, error.context("prime concealed window"));
+                return;
             }
         }
         self.window_standing
@@ -1371,6 +1464,9 @@ impl Rig {
         } else {
             attributes
         };
+        // No position hint: i3 prefers a hinted position to the window's own
+        // geometry, so a hint would override every reveal placement.
+        let attributes = attributes.with_visible(!A::WINDOW.conceals_launch(capabilities));
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -1498,18 +1594,8 @@ impl Rig {
                 })
         );
         let user_commands = main_phase!("render.prepare", {
-            let mut renderer = gpu.render.renderer.write();
-            for (id, image_deltas) in &delta.set {
-                for image_delta in image_deltas {
-                    renderer.update_texture(
-                        &gpu.render.device,
-                        &gpu.render.queue,
-                        *id,
-                        image_delta,
-                    );
-                }
-            }
-            renderer.update_buffers(
+            upload_textures(&gpu.render, delta);
+            gpu.render.renderer.write().update_buffers(
                 &gpu.render.device,
                 &gpu.render.queue,
                 &mut encoder,
@@ -1620,6 +1706,16 @@ fn free_textures(render: &RenderState, delta: &egui::TexturesDelta) {
     let mut renderer = render.renderer.write();
     for id in &delta.free {
         renderer.free_texture(id);
+    }
+}
+
+/// Apply a pass's texture uploads.
+fn upload_textures(render: &RenderState, delta: &egui::TexturesDelta) {
+    let mut renderer = render.renderer.write();
+    for (id, image_deltas) in &delta.set {
+        for image_delta in image_deltas {
+            renderer.update_texture(&render.device, &render.queue, *id, image_delta);
+        }
     }
 }
 
